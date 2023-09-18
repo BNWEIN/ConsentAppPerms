@@ -1,10 +1,9 @@
 <#
 .SYNOPSIS
+Consents an app with application permissions in customer tenants
 
 .DESCRIPTION
-
-.PARAMETER customerTenantId
-GUID property
+Note, leverages the SAM app model
 
 .NOTES
 Created by   : Roel van der Wegen
@@ -13,11 +12,11 @@ More info    : https://github.com/rvdwegen
 #>
 
 # Connecting to Azure Parameters
-$tenantID = "<enter your partner tenant ID here>"
-$applicationID = "<Enter your SAM APP ID Here>"
-$clientKey = "<Enter your SAM Secret here>"
-$PartnerrefreshToken = "<Enter your refresh token here>"
-$TenantMGMTAppId = '<Enter your Halo PSA CSP - Partner Center Connection (multitenant) app ID here>'
+$CSPtenant = "yourtenantid"
+$applicationID = "<enter application id here>"
+$clientKey = "<enter client secret here>"
+$PartnerrefreshToken = "<enter Refresh Token here>"
+$AppId = '<Enter your Halo PSA CSP - Partner Center Connection (multitenant) app ID here>' # This is the app you want to consent in your customer tenants
 
 # in 7.2 the progress on Invoke-WebRequest is returned to the runbook log output
 $ProgressPreference = 'SilentlyContinue'
@@ -74,8 +73,7 @@ function Get-MicrosoftToken {
     try {
         $AuthResponse = (Invoke-WebRequest @Params).Content | ConvertFrom-Json
     } catch {
-        Write-Error "Authentication Error Occured $_"
-        return
+        throw "Authentication Error Occured $_"
     }
 
     return $AuthResponse
@@ -87,78 +85,64 @@ $commonTokenSplat = @{
     RefreshToken = $PartnerrefreshToken
 }
 
-# Authenticate to Microsoft Grpah
-Write-Host "Authenticating to Microsoft Graph via REST method"
- 
-$url = "https://login.microsoftonline.com/$tenantId/oauth2/token"
-$resource = "https://graph.microsoft.com/"
-$restbody = @{
-         grant_type    = 'client_credentials'
-         client_id     = $applicationID
-         client_secret = $clientKey
-         resource      = $resource
-}
-     
- # Get the return Auth Token
- $token = Invoke-RestMethod -Method POST -Uri $url -Body $restbody
-
- # Set the baseurl to MS Graph-API (BETA API)
-$baseUrl = 'https://graph.microsoft.com/beta'
-
-if ($ogtoken = (Get-MicrosoftToken @commonTokenSplat -TenantID $tenantID -Scope "https://graph.microsoft.com/.default" -ErrorAction SilentlyContinue).Access_Token) {
-    $ogheader = @{
-        Authorization = 'bearer {0}' -f $ogtoken
-        Accept        = "application/json"
+try {
+    if ($CSPtoken = (Get-MicrosoftToken @commonTokenSplat -TenantID $CSPtenant -Scope "https://graph.microsoft.com/.default").Access_Token) {
+        $CSPheader = @{
+            Authorization = 'bearer {0}' -f $CSPtoken
+            Accept        = "application/json"
+        }
     }
-} else {
-    throw "Unable to authenticate to Prime Tenant tenant."
+
+    # Get tenants. There are many ways to rome. This one will work in most cases
+    $customertenants = (Invoke-RestMethod -Method GET -headers $CSPheader -Uri 'https://graph.microsoft.com/beta/contracts?$top=999').value
+
+    # Get app details including permissions
+    $AppDetails = (Invoke-RestMethod -Method GET -Uri "https://graph.microsoft.com/beta/applications(appId='$AppId')" -headers $CSPheader)
+} catch {
+    throw "$($_.Exception.Message)"
 }
-
-# Build the Base URL for the API call
-$url = $baseUrl + '/contracts?$top=999'
-
-# Call the REST-API
-$customertenants = Invoke-RestMethod -Method GET -headers $ogheader -Uri $url
-
-$tenantMGMTAppDetails = (Invoke-RestMethod -Method GET -Uri "https://graph.microsoft.com/beta/applications(appId='$TenantMGMTAppId')" -headers $ogheader)
-
-#endregion
 
 #region ############################## Loop through tenants ####################################
 
-foreach ($tenant in $customertenants.value) {
+foreach ($tenant in $customertenants) {
 
     try {
-        #Write-Output "Processing tenant: $($Tenant.defaultDomainName) | $($tenant.TenantId)"
+        Write-Output "Processing tenant: $($Tenant.defaultDomainName) | $($tenant.customerId)"
 
-        if ($token = (Get-MicrosoftToken @commonTokenSplat -TenantID $($tenant.customerId) -Scope "https://graph.microsoft.com/.default" -ErrorAction SilentlyContinue).Access_Token) {
-            $header = @{
-                Authorization = 'bearer {0}' -f $token
-                Accept        = "application/json"
+        try {
+            if ($token = (Get-MicrosoftToken @commonTokenSplat -TenantID $($tenant.customerId) -Scope "https://graph.microsoft.com/.default").Access_Token) {
+                $header = @{
+                    Authorization = 'bearer {0}' -f $token
+                    Accept        = "application/json"
+                }
             }
-        } else {
-            throw "Unable to authenticate to tenant: $($Tenant.defaultDomainName) | $($tenant.customerId)"
+        } catch {
+            throw "$($_.Exception.Message)"
         }
 
-        # Check if there is a service principal for the app, if not create it
-        if (!($svcPrincipal = (Invoke-RestMethod -Method "GET" -Headers $header -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$($tenantMGMTAppDetails.appId)'").value)) {
-            # Define values for the new svcPrincipal
-            $newsvcPrincipalBody = @{
-                appId = $tenantMGMTAppDetails.appId
-            } | ConvertTo-Json
+        try {
+            # Check if there is a service principal for the app, if not create it
+            if (!($svcPrincipal = (Invoke-RestMethod -Method "GET" -Headers $header -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$($AppDetails.appId)'").value)) {
+                # Define values for the new svcPrincipal
+                $newsvcPrincipalBody = @{
+                    appId = $AppDetails.appId
+                } | ConvertTo-Json
 
-            # Create the svcPrincipal
-            if ($svcPrincipal = (Invoke-RestMethod -Method "POST" -Headers $header -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -Body $newsvcPrincipalBody -ContentType "application/json")) {
-                #Write-Output "svcPrincipal id $($svcPrincipal.id) was created"
+                # Create the svcPrincipal
+                if ($svcPrincipal = (Invoke-RestMethod -Method "POST" -Headers $header -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -Body $newsvcPrincipalBody -ContentType "application/json")) {
+                    #Write-Output "svcPrincipal id $($svcPrincipal.id) was created"
+                } else {
+                    throw "Failed to create svcPrincipal"
+                }
             } else {
-                Write-Warning "Failed to create svcPrincipal"
+                $roles = (Invoke-RestMethod -Method GET -Headers $header -Uri "https://graph.microsoft.com/beta/servicePrincipals(appId='$($AppDetails.appId)')/appRoleAssignments").value
             }
-        } else {
-            $roles = (Invoke-RestMethod -Method GET -Headers $header -Uri "https://graph.microsoft.com/beta/servicePrincipals(appId='$($tenantMGMTAppDetails.appId)')/appRoleAssignments").value
+        } catch {
+            throw "$($_.Exception.Message)"
         }
 
         # Consent App permissions one by one
-        foreach ($ResourceApp in $tenantMGMTAppDetails.requiredResourceAccess) {
+        foreach ($ResourceApp in $AppDetails.requiredResourceAccess) {
             $ApiApp = $null
             $ApiApp = (Invoke-RestMethod -Method GET -Headers $header -Uri "https://graph.microsoft.com/v1.0/servicePrincipals(appId='$($ResourceApp.ResourceAppId)')")
             foreach ($grant in $ResourceApp.ResourceAccess) {
