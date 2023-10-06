@@ -11,6 +11,12 @@ Date Coded   : August 2023
 More info    : https://github.com/rvdwegen
 #>
 
+Param(
+    # TenantId of specific customer
+    [Parameter(Mandatory=$false)]
+    [GUID]$customerTenantId
+)
+
 # Connecting to Azure Parameters
 $CSPtenant = "yourtenantid"
 $applicationID = "<enter application id here>"
@@ -93,8 +99,12 @@ try {
         }
     }
 
-    # Get tenants. There are many ways to rome. This one will work in most cases
-    $customertenants = (Invoke-RestMethod -Method GET -headers $CSPheader -Uri 'https://graph.microsoft.com/beta/contracts?$top=999').value
+    if ($customertenantid) {
+        $uri = 'https://graph.microsoft.com/v1.0/contracts?$filter=customerId eq ' + $customertenantid
+        $customertenants = (Invoke-RestMethod -Method GET -headers $CSPheader -Uri $uri).value
+    } else {
+        $customertenants = (Invoke-RestMethod -Method GET -headers $CSPheader -Uri 'https://graph.microsoft.com/beta/contracts?$top=999').value
+    }
 
     # Get app details including permissions
     $AppDetails = (Invoke-RestMethod -Method GET -Uri "https://graph.microsoft.com/beta/applications(appId='$AppId')" -headers $CSPheader)
